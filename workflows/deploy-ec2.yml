@@ -1,0 +1,159 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_backend:
+        description: 'Deploy Backend'
+        required: false
+        default: 'true'
+        type: boolean
+      deploy_frontend:
+        description: 'Deploy Frontend'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  deploy-backend:
+    name: Deploy Backend to EC2
+    runs-on: ubuntu-latest
+    if: |
+      (contains(github.event.head_commit.modified, 'fibo-backend/') || 
+       contains(github.event.head_commit.added, 'fibo-backend/') ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'workflow_dispatch' || github.event.inputs.deploy_backend == 'true')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy Backend to EC2
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        port: ${{ secrets.EC2_SSH_PORT || 22 }}
+        timeout: 300s
+        script: |
+          set -e
+          echo "🚀 Starting backend deployment..."
+          
+          cd /opt/fibonauti/fibo-backend
+          
+          echo "📥 Pulling latest code..."
+          git fetch origin
+          git reset --hard origin/main
+          
+          echo "🐍 Setting up Python environment..."
+          source venv/bin/activate
+          pip install --upgrade pip --quiet
+          
+          echo "📦 Installing dependencies..."
+          pip install -r requirements.txt --quiet
+          
+          echo "🗄️ Running database migrations..."
+          alembic upgrade head
+          
+          echo "🔄 Restarting service..."
+          sudo systemctl restart fibo-backend
+          
+          echo "⏳ Waiting for service to start..."
+          sleep 5
+          
+          echo "✅ Checking service status..."
+          if sudo systemctl is-active --quiet fibo-backend; then
+            echo "✅ Backend service is running!"
+            sudo systemctl status fibo-backend --no-pager -l
+          else
+            echo "❌ Backend service failed to start!"
+            sudo journalctl -u fibo-backend -n 50 --no-pager
+            exit 1
+          fi
+          
+          echo "🎉 Backend deployment completed successfully!"
+
+    - name: Verify Backend Health
+      if: always()
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        port: ${{ secrets.EC2_SSH_PORT || 22 }}
+        script: |
+          echo "🏥 Checking backend health endpoint..."
+          sleep 3
+          if curl -f http://localhost:8000/api/v1/health > /dev/null 2>&1; then
+            echo "✅ Backend health check passed!"
+          else
+            echo "⚠️ Backend health check failed (service may still be starting)"
+          fi
+
+  deploy-frontend:
+    name: Deploy Frontend to EC2
+    runs-on: ubuntu-latest
+    if: |
+      (contains(github.event.head_commit.modified, 'frontend/') || 
+       contains(github.event.head_commit.added, 'frontend/') ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'workflow_dispatch' || github.event.inputs.deploy_frontend == 'true')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy Frontend to EC2
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        port: ${{ secrets.EC2_SSH_PORT || 22 }}
+        timeout: 600s
+        script: |
+          set -e
+          echo "🚀 Starting frontend deployment..."
+          
+          cd /opt/fibonauti/fibo-dashboard-ui
+          
+          echo "📥 Pulling latest code..."
+          git fetch origin
+          git reset --hard origin/main
+          
+          echo "📦 Installing dependencies..."
+          npm ci --legacy-peer-deps --silent
+          
+          echo "🏗️ Building Angular application..."
+          npm run build -- --configuration production
+          
+          echo "✅ Verifying build output..."
+          if [ ! -d "dist/fibo-dashboard-ui/browser" ]; then
+            echo "❌ Build failed! dist/fibo-dashboard-ui/browser not found"
+            exit 1
+          fi
+          
+          echo "📊 Build size:"
+          du -sh dist/fibo-dashboard-ui/browser
+          
+          echo "🔄 Testing Nginx configuration..."
+          sudo nginx -t
+          
+          echo "🔄 Reloading Nginx..."
+          sudo systemctl reload nginx
+          
+          echo "✅ Verifying Nginx status..."
+          if sudo systemctl is-active --quiet nginx; then
+            echo "✅ Nginx is running!"
+          else
+            echo "❌ Nginx failed to reload!"
+            sudo systemctl status nginx --no-pager -l
+            exit 1
+          fi
+          
+          echo "🎉 Frontend deployment completed successfully!"
+

@@ -1,0 +1,94 @@
+name: Deploy Backend to AWS ECS
+
+on:
+  push:
+    branches: [ "dev" ]
+    paths:
+      - 'fibo-backend/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-2
+  ECR_REPOSITORY: fibo-backend
+  ECS_CLUSTER: fibo-cluster
+  ECS_SERVICE: fibo-backend-service
+  ECS_TASK_DEFINITION: fibo-backend
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Create ECR repository if it doesn't exist
+      run: |
+        aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} || \
+        aws ecr create-repository \
+          --repository-name ${{ env.ECR_REPOSITORY }} \
+          --region ${{ env.AWS_REGION }} \
+          --image-scanning-configuration scanOnPush=true \
+          --encryption-configuration encryptionType=AES256
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd fibo-backend
+        echo "Building Docker image..."
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+        echo "Pushing image to ECR..."
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "✅ Image pushed successfully: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+    - name: Download current task definition
+      id: task-definition
+      run: |
+        echo "Downloading task definition..."
+        aws ecs describe-task-definition \
+          --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+          --query taskDefinition > task-definition.json
+        echo "✅ Task definition downloaded"
+
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: fibo-backend
+        image: ${{ steps.build-image.outputs.image }}
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: true
+    
+    - name: Deployment Summary
+      run: |
+        echo "✅ Deployment completed successfully!"
+        echo "Image: ${{ steps.build-image.outputs.image }}"
+        echo "Cluster: ${{ env.ECS_CLUSTER }}"
+        echo "Service: ${{ env.ECS_SERVICE }}"
+
+
